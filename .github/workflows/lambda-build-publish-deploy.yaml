@@ -1,0 +1,77 @@
+name: lambda-build-publish-deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        type: string
+        required: true
+      data_pipeline:
+        type: string
+        required: true
+      blueprint_type:
+        type: string
+        default: process
+      infra_ref:
+        type: string
+        default: main
+      infra_repo:
+        type: string
+        default: do-aws-pipeline-infra
+    secrets:
+      INFRA_REPO_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-publish-deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ inputs.environment }}
+      PIPELINE: ${{ inputs.data_pipeline }}
+      BUCKET: ${{ vars.LAMBDA_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Zip src/lambda and upload to S3
+        id: upload
+        run: |
+          KEY="$PIPELINE/$ENV/${GITHUB_SHA::7}/lambda.zip"
+          (cd src/lambda && zip -r "$GITHUB_WORKSPACE/lambda.zip" . -x "*__pycache__*")
+          aws s3 cp lambda.zip "s3://$BUCKET/$KEY"
+          echo "key=$KEY" >> "$GITHUB_OUTPUT"
+
+      - name: Check out infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+          fetch-depth: 0
+
+      - name: Update config.yaml, commit and push
+        env:
+          S3_KEY: ${{ steps.upload.outputs.key }}
+          TARGET: ${{ inputs.environment }}/${{ inputs.data_pipeline }}/${{ inputs.blueprint_type }}/config.yaml
+          REF: ${{ inputs.infra_ref }}
+        run: |
+          cd infra
+          git switch "$REF" 2>/dev/null || git switch -c "$REF"
+          mkdir -p "$(dirname "$TARGET")"
+          cp "../config/lambda/${ENV}_config.yaml" "$TARGET"
+          yq -i '.lambda_settings.s3_bucket = strenv(BUCKET)' "$TARGET"
+          yq -i '.lambda_settings.s3_key = strenv(S3_KEY)' "$TARGET"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "No config change"; exit 0; fi
+          git commit -m "chore($PIPELINE): $ENV lambda config from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          git push -u origin "$REF"

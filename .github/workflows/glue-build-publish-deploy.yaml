@@ -1,0 +1,90 @@
+name: glue-build-publish-deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment: # dev | test | preprod | prod
+        type: string
+        required: true
+      data_pipeline: # e.g. ppi-triage
+        type: string
+        required: true
+      blueprint_type:
+        type: string
+        default: process
+      entry_script:
+        type: string
+        default: main.py
+      infra_ref: # infra branch to commit to (INFRA_REF)
+        type: string
+        default: main
+      infra_repo:
+        type: string
+        default: do-aws-pipeline-infra
+    secrets:
+      INFRA_REPO_TOKEN:
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  build-publish-deploy:
+    runs-on: ubuntu-latest
+    env:
+      ENV: ${{ inputs.environment }}
+      PIPELINE: ${{ inputs.data_pipeline }}
+      ENTRY: ${{ inputs.entry_script }}
+      BUCKET: ${{ vars.GLUE_SCRIPTS_BUCKET }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Zip src/glue and upload to S3
+        id: upload
+        run: |
+          PREFIX="$PIPELINE/$ENV/${GITHUB_SHA::7}"
+          (cd src/glue && zip -r "$GITHUB_WORKSPACE/glue_libs.zip" . -x "$ENTRY" -x "*__pycache__*")
+          aws s3 cp "src/glue/$ENTRY" "s3://$BUCKET/$PREFIX/$ENTRY"
+          aws s3 cp glue_libs.zip "s3://$BUCKET/$PREFIX/glue_libs.zip"
+          echo "script=s3://$BUCKET/$PREFIX/$ENTRY" >> "$GITHUB_OUTPUT"
+          echo "libs=s3://$BUCKET/$PREFIX/glue_libs.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Check out infra repo
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository_owner }}/${{ inputs.infra_repo }}
+          token: ${{ secrets.INFRA_REPO_TOKEN }}
+          path: infra
+          fetch-depth: 0
+
+      - name: Update glue_job_config.yaml
+        env:
+          SCRIPT_LOCATION: ${{ steps.upload.outputs.script }}
+          EXTRA_PY_FILES: ${{ steps.upload.outputs.libs }}
+          TARGET: ${{ inputs.environment }}/${{ inputs.data_pipeline }}/${{ inputs.blueprint_type }}/glue_job_config.yaml
+          REF: ${{ inputs.infra_ref }}
+        run: |
+          cd infra
+          git switch "$REF" 2>/dev/null || git switch -c "$REF"
+          mkdir -p "$(dirname "$TARGET")"
+          cp "../config/glue/${ENV}_glue_job_config.yaml" "$TARGET"
+          yq -i '.glue_job_settings.script_location = strenv(SCRIPT_LOCATION)' "$TARGET"
+          yq -i '.glue_job_settings.extra_py_files = strenv(EXTRA_PY_FILES)' "$TARGET"
+
+      - name: Commit and push
+        working-directory: infra
+        env:
+          REF: ${{ inputs.infra_ref }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then echo "No config change"; exit 0; fi
+          git commit -m "chore($PIPELINE): $ENV glue config from ${GITHUB_REPOSITORY}@${GITHUB_SHA::7}"
+          git push -u origin "$REF"

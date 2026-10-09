@@ -1,0 +1,31 @@
+name: unlock-terraform-state
+
+on:
+  workflow_call:
+    inputs:
+      path: # e.g. dev/ppi-triage/process
+        type: string
+        required: true
+      lock_id: # shown in the "Error acquiring the state lock" message
+        type: string
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  unlock:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ${{ inputs.path }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: hashicorp/setup-terraform@v3
+      - run: terraform init -input=false
+      - run: terraform force-unlock -force "${{ inputs.lock_id }}"
